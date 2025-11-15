@@ -19,6 +19,7 @@ return new class extends Migration
             $table->dateTime('end_date')->nullable();
             $table->timestamp('timestamp')->nullable();
             $table->unsignedInteger('capacity')->default(0);
+            $table->index(['start_date', 'end_date'], 'idx_events_start_end');
             $table->timestamps();
         });
     }

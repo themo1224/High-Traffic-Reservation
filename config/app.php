@@ -123,4 +123,6 @@ return [
         'store' => env('APP_MAINTENANCE_STORE', 'database'),
     ],
 
+    'running_event_ttl' => env('RUNNING_EVENT_TTL', 15)
+
 ];

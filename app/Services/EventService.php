@@ -2,94 +2,121 @@
 
 namespace App\Services;
 
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Carbon;
+use App\Repositories\EventRepositoryInterface;
+use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Str;
 
 class EventService
 {
-    protected string $runningCacheKey = 'events:running';
-    protected string $indexCachePrefix = 'events:index';
+    protected string $indexCachePrefix = 'events:index'; // page-specific keys
     protected string $lockPrefix = 'lock:events_index';
+    protected EventRepositoryInterface $repo;
 
-    
+    public function __construct(EventRepositoryInterface $repo)
+    {
+        $this->repo = $repo;
+    }
+
     /**
-     * Simple paginated index of events with cache+lock protection.
+     * Paginated index using Redis (soft-TTL + safe lock).
      *
-     * @param int $page 1-based
      * @param int $per
-     * @param int $ttl seconds for cache
-     * @param int $lockTtl seconds for lock
+     * @param int $page
+     * @param int $ttl fresh TTL seconds (e.g. 15)
+     * @param int $lockTtl lock TTL seconds (e.g. 10)
      * @return \Illuminate\Support\Collection
      */
-
-     public function index(int $per, int $page, int $ttl, int $lockTtl)
-     {
+    public function index(int $per, int $page, int $ttl = 15, int $lockTtl = 10)
+    {
         $page = max(1, $page);
         $per = max(1, $per);
+
         $cacheKey = "{$this->indexCachePrefix}:p{$page}:n{$per}";
-        $lockName = "{$this->lockPrefix}:p{$page}:n{$per}";
+        $lockKey = "{$this->lockPrefix}:p{$page}:n{$per}";
 
-        //return cached if exists
-        $cached = Cache::get($cacheKey);
-        if ($cached !== null) {
-            return $cached;
-        }
+        // try read payload (JSON) from Redis
+        $raw = Redis::get($cacheKey);
+        if ($raw !== null) {
+            $payload = json_decode($raw, true);
+            $now = time();
 
-        //try to get lock to refresh 
-        $lock = Cache::lock($lockName, $lockTtl);
-        if ($lock->get()) {
-            try {
-                $data = $this->queryIndex($page, $per);
-                Cache::put($cacheKey, $data, $ttl);
-                return $data;
-            } finally {
-                $lock->release();
+            // if still fresh, return direct
+            if (($payload['fresh_until'] ?? 0) >= $now) {
+                return collect($payload['value']);
             }
         }
 
-        // lock held -> return stale if any
-        $stale = Cache::get($cacheKey);
-        if ($stale !== null) {
-            return $stale;
+        // try to acquire lock using SET NX EX with a token
+        $token = Str::random(40);
+        // Use Redis SET with NX + EX flags. Depending on client, signature may work as array options too.
+        $acquired = Redis::set($lockKey, $token, 'NX', 'EX', $lockTtl);
+
+        if ($acquired) {
+            try {
+                // we own lock -> rebuild from repo
+                $data = $this->repo->getIndex($page, $per);
+
+                // write soft-TTL payload: fresh_until + hard TTL
+                $freshSeconds = max(1, $ttl);                 // fresh window
+                $hardSeconds = max(300, $freshSeconds * 20);  // keep payload longer as hard TTL
+
+                $payloadToStore = [
+                    'value' => $data,
+                    'fresh_until' => time() + $freshSeconds,
+                ];
+
+                // store JSON with hard TTL
+                Redis::setex($cacheKey, $hardSeconds, json_encode($payloadToStore));
+
+                return $data;
+            } finally {
+                // safe release: only delete if token matches (Lua)
+                $this->releaseLockLua($lockKey, $token);
+            }
         }
 
-        // final fallback: query DB directly
-        $data = $this->queryIndex($page, $per);
-        Cache::put($cacheKey, $data, $ttl);
+        // lock not acquired -> rebuild directly via repo and write payload
+        $data = $this->repo->getIndex($page, $per);
+        $freshSeconds = max(1, $ttl);
+        $hardSeconds = max(300, $freshSeconds * 20);
+        $payloadToStore = [
+            'value' => $data,
+            'fresh_until' => time() + $freshSeconds,
+        ];
+        Redis::setex($cacheKey, $hardSeconds, json_encode($payloadToStore));
         return $data;
     }
 
     /**
-     * DB query for index (kept separate for testability).
+     * Release lock safely using Lua to avoid deleting another owner's lock.
      */
-    protected function queryIndex(int $page, int $per)
+    protected function releaseLockLua(string $lockKey, string $token): void
     {
-        $offset = ($page - 1) * $per;
-
-        return DB::table('events')
-            ->select('id', 'name', 'start_date', 'end_date', 'capacity')
-            ->orderBy('start_date')
-            ->offset($offset)
-            ->limit($per)
-            ->get();
+        $script = <<<'LUA'
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end
+LUA;
+        // eval(script, numKeys, key, arg1)
+        Redis::eval($script, 1, $lockKey, $token);
     }
 
     /**
-     * Invalidate a specific page (or all pages) after changes.
+     * Invalidate page caches (naive).
      */
     public function invalidateIndexCache(int $page = null, int $per = null): void
     {
         if ($page && $per) {
-            Cache::forget("{$this->indexCachePrefix}:p{$page}:n{$per}");
+            $key = "{$this->indexCachePrefix}:p{$page}:n{$per}";
+            Redis::del($key);
             return;
         }
 
-        // naive purge: you can improve with tags or tracking keys
-        // here we remove first few pages commonly used
         for ($p = 1; $p <= 5; $p++) {
-            Cache::forget("{$this->indexCachePrefix}:p{$p}:n{$per}");
+            $key = "{$this->indexCachePrefix}:p{$p}:n{$per}";
+            Redis::del($key);
         }
-    
-     }
+    }
 }

@@ -1,11 +1,10 @@
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Http\Controllers;
 
-use App\Http\Controllers\Controller;
 use App\Services\EventService;
-use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class EventController extends Controller
 {
@@ -19,22 +18,25 @@ class EventController extends Controller
     public function index(Request $request): JsonResponse
     {
         $page = (int) $request->query('page', 1);
-        $per  = (int) $request->query('per', 15);
-        $ttl  = (int) $request->query('ttl', 15);
-        $lock = (int) $request->query('lock', 10);
-
-        $data = $this->events->index($per, $page, $ttl, $lock);
+        $per = (int) $request->query('per', 15);
+        // ttl / lock query params are no longer required by the service — keep API simple
+        $data = $this->events->index($per, $page);
 
         return response()->json($data);
     }
 
     public function invalidateCache(Request $request): JsonResponse
     {
-        $page = $request->input('page');
-        $per  = $request->input('per');
+        $validated = $request->validate([
+            'page' => 'nullable|integer|min:1',
+            'per' => 'nullable|integer|min:1',
+        ]);
 
-        $this->events->invalidateIndexCache($page ? (int)$page : null, $per ? (int)$per : null);
+        $page = $validated['page'] ?? null;
+        $per = $validated['per'] ?? null;
 
-        return response()->json(['ok' => true]);
+        $this->events->invalidateIndexCache($page, $per);
+
+        return response()->json(['ok' => true], 200);
     }
 }
